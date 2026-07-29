@@ -116,7 +116,7 @@ app.get('/api/data', async (req, res) => {
 // POST /api/update-record — proxy record updates back to Google Sheets database
 app.post('/api/update-record', async (req, res) => {
   try {
-    const UPDATE_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbz7nbrvyjN39_D4eTDDB9A9nKS4hhLkcMXFoYT6WUxCDt9NGn1fBGBsavi6Sku1Ze3G/exec';
+    const UPDATE_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyfkvGhPuaVPFe62kyDhCSbKm4UwJ-Rbmr6KQfHfJjtE_Dp9E5dGdB1Bq1NS1r15U4e/exec';
     
     console.log('\nSending update request to Google Sheets:', JSON.stringify(req.body, null, 2));
 
