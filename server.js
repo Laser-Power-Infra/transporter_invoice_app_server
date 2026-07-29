@@ -113,6 +113,37 @@ app.get('/api/data', async (req, res) => {
   }
 });
 
+// POST /api/update-record — proxy record updates back to Google Sheets database
+app.post('/api/update-record', async (req, res) => {
+  try {
+    const UPDATE_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbz7nbrvyjN39_D4eTDDB9A9nKS4hhLkcMXFoYT6WUxCDt9NGn1fBGBsavi6Sku1Ze3G/exec';
+    
+    console.log('\nSending update request to Google Sheets:', JSON.stringify(req.body, null, 2));
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+
+    const response = await fetch(UPDATE_SCRIPT_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(req.body),
+      signal: controller.signal
+    });
+    
+    clearTimeout(timeout);
+
+    const result = await response.json();
+    console.log('Apps Script update response:', result);
+    
+    res.json(result);
+  } catch (err) {
+    console.error('Update proxy error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // POST /upload — upload PDF to Google Drive
 const upload = multer({
   storage: multer.memoryStorage(),
