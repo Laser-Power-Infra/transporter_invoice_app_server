@@ -380,6 +380,47 @@ app.post('/api/delete-invoice', async (req, res) => {
   }
 });
 
+// ---------- N8N Webhook Alerts / Notifications ----------
+let latestNotification = null;
+
+// POST /agentError
+app.post('/agentError', (req, res) => {
+  latestNotification = {
+    id: Date.now() + Math.random().toString(36).substr(2, 5),
+    type: 'error',
+    message: 'Please Connect to the Developer API Key not Working'
+  };
+  console.log('Received agentError hook:', latestNotification);
+  res.json({ success: true, notification: latestNotification });
+});
+
+// POST /excutedSucess
+app.post('/excutedSucess', (req, res) => {
+  latestNotification = {
+    id: Date.now() + Math.random().toString(36).substr(2, 5),
+    type: 'success',
+    message: 'Check the Bill bill is complete.'
+  };
+  console.log('Received excutedSucess hook:', latestNotification);
+  res.json({ success: true, notification: latestNotification });
+});
+
+// POST /executedSuccess (spelling fallback)
+app.post('/executedSuccess', (req, res) => {
+  latestNotification = {
+    id: Date.now() + Math.random().toString(36).substr(2, 5),
+    type: 'success',
+    message: 'Check the Bill bill is complete.'
+  };
+  console.log('Received executedSuccess hook:', latestNotification);
+  res.json({ success: true, notification: latestNotification });
+});
+
+// GET /api/agent-notification
+app.get('/api/agent-notification', (req, res) => {
+  res.json({ success: true, notification: latestNotification });
+});
+
 
 if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
   app.listen(PORT, () => {
