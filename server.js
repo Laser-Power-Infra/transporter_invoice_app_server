@@ -400,7 +400,7 @@ app.post('/excutedSucess', (req, res) => {
   latestNotification = {
     id: Date.now() + Math.random().toString(36).substr(2, 5),
     type: 'success',
-    message: 'Check the Bill bill is complete.',
+    message: 'Check the Bill, booking is complete.',
     timestamp: Date.now()
   };
   console.log('Received excutedSucess hook:', latestNotification);
@@ -412,7 +412,7 @@ app.post('/executedSuccess', (req, res) => {
   latestNotification = {
     id: Date.now() + Math.random().toString(36).substr(2, 5),
     type: 'success',
-    message: 'Check the Bill bill is complete.',
+    message: 'Check the Bill, booking is complete.',
     timestamp: Date.now()
   };
   console.log('Received executedSuccess hook:', latestNotification);
