@@ -388,7 +388,8 @@ app.post('/agentError', (req, res) => {
   latestNotification = {
     id: Date.now() + Math.random().toString(36).substr(2, 5),
     type: 'error',
-    message: 'Please Connect to the Developer API Key not Working'
+    message: 'Please Connect to the Developer API Key not Working',
+    timestamp: Date.now()
   };
   console.log('Received agentError hook:', latestNotification);
   res.json({ success: true, notification: latestNotification });
@@ -399,7 +400,8 @@ app.post('/excutedSucess', (req, res) => {
   latestNotification = {
     id: Date.now() + Math.random().toString(36).substr(2, 5),
     type: 'success',
-    message: 'Check the Bill bill is complete.'
+    message: 'Check the Bill bill is complete.',
+    timestamp: Date.now()
   };
   console.log('Received excutedSucess hook:', latestNotification);
   res.json({ success: true, notification: latestNotification });
@@ -410,7 +412,8 @@ app.post('/executedSuccess', (req, res) => {
   latestNotification = {
     id: Date.now() + Math.random().toString(36).substr(2, 5),
     type: 'success',
-    message: 'Check the Bill bill is complete.'
+    message: 'Check the Bill bill is complete.',
+    timestamp: Date.now()
   };
   console.log('Received executedSuccess hook:', latestNotification);
   res.json({ success: true, notification: latestNotification });
