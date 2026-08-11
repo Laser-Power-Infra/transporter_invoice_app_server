@@ -314,6 +314,60 @@ app.post('/api/share-folder', async (req, res) => {
   }
 });
 
+// POST /api/reupload - duplicate a Google Drive PDF to trigger n8n processing again
+app.post('/api/reupload', async (req, res) => {
+  try {
+    const { fileUrl, invoiceNumber, billType } = req.body;
+    if (!fileUrl) {
+      return res.status(400).json({ success: false, error: 'No fileUrl provided' });
+    }
+
+    const extractFileId = (url) => {
+      const match = url.match(/\/file\/d\/([a-zA-Z0-9_-]+)/) || url.match(/[?&]id=([a-zA-Z0-9_-]+)/);
+      return match ? match[1] : null;
+    };
+
+    const fileId = extractFileId(fileUrl);
+    if (!fileId) {
+      return res.status(400).json({ success: false, error: 'Invalid Google Drive URL' });
+    }
+
+    const drive = google.drive({ version: 'v3', auth: oauth2Client });
+    
+    console.log(`Reprocessing Drive file ID: ${fileId}`);
+    const metadata = await drive.files.get({ fileId, fields: 'name' });
+    const originalName = metadata.data.name;
+
+    const copyRes = await drive.files.copy({
+      fileId: fileId,
+      requestBody: {
+        name: originalName,
+        parents: [DRIVE_FOLDER_ID]
+      },
+      fields: 'id, name, webViewLink'
+    });
+
+    await drive.permissions.create({
+      fileId: copyRes.data.id,
+      requestBody: { role: 'reader', type: 'anyone' }
+    });
+
+    console.log(`Re-upload copy completed: ${copyRes.data.name} (${copyRes.data.id})`);
+    
+    res.json({
+      success: true,
+      fileId: copyRes.data.id,
+      fileUrl: copyRes.data.webViewLink,
+      filename: copyRes.data.name,
+      invoiceNumber
+    });
+  } catch (err) {
+    console.error('Re-upload error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
 // ---------- Google Sheets Write-Back Row Deletion ----------
 async function deleteRowsFromSheet(sheetName, conditions) {
   try {
