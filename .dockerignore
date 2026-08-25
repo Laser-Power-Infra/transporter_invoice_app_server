@@ -1,0 +1,9 @@
+node_modules
+npm-debug.log
+.git
+.gitignore
+*.md
+find_in_app.js
+inspect_rows.js
+test_mysql_load.js
+test_response.js

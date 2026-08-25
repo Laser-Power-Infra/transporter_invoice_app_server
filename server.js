@@ -7,6 +7,8 @@ import path from 'path';
 import { Readable } from 'stream';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
+import compression from 'compression';
+import mysql from 'mysql2/promise';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(__dirname, '.env') });
@@ -84,34 +86,243 @@ oauth2Client.on('tokens', (newTokens) => {
 // ---------- Express app ----------
 const app = express();
 
+app.use(compression());
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '100mb' }));
+app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Cache variables
+// Cache & Concurrency variables
 let dataCache = null;
 let dataCacheTime = 0;
 const CACHE_TTL = 300000; // 5 minutes in milliseconds
+let activeFetchPromise = null;
 
-// GET /api/data — proxy to Google Apps Script (no CORS server-to-server)
-app.get('/api/data', async (req, res) => {
+// MySQL configuration
+const dbConfig = {
+  host: process.env.MYSQL_HOST || 'localhost',
+  port: parseInt(process.env.MYSQL_PORT || '3306', 10),
+  user: process.env.MYSQL_USER || 'root',
+  password: process.env.MYSQL_PASSWORD || 'Minmoy@1234@',
+  database: process.env.MYSQL_DATABASE || 'invoice_db'
+};
+
+async function getDBConnection() {
   try {
-    const forceRefresh = req.query.refresh === 'true' || req.query.forceRefresh === 'true';
-    const now = Date.now();
+    return await mysql.createConnection(dbConfig);
+  } catch (err) {
+    if (err.code === 'ER_BAD_DB_ERROR') {
+      console.log(`Database "${dbConfig.database}" does not exist yet. Creating database...`);
+      const tempConn = await mysql.createConnection({
+        host: dbConfig.host,
+        port: dbConfig.port,
+        user: dbConfig.user,
+        password: dbConfig.password
+      });
+      await tempConn.query(`CREATE DATABASE IF NOT EXISTS \`${dbConfig.database}\``);
+      await tempConn.end();
+      return await mysql.createConnection(dbConfig);
+    }
+    throw err;
+  }
+}
+
+function getAllKeys(rows) {
+  const keys = new Set();
+  rows.forEach(row => {
+    Object.keys(row).forEach(k => keys.add(k));
+  });
+  return Array.from(keys);
+}
+
+// Dynamically create tables and insert rows in bulk
+async function syncSheetsToMySQL(fullData) {
+  let conn;
+  try {
+    conn = await getDBConnection();
     
-    if (dataCache && (now - dataCacheTime < CACHE_TTL) && !forceRefresh) {
-      console.log('Serving data from memory cache');
-      return res.json(dataCache);
+    // 1. Process Invoices -> Table: "Item Details"
+    const invoices = fullData.invoices || [];
+    if (invoices.length > 0) {
+      const columns = getAllKeys(invoices);
+      await ensureTableExists(conn, 'Item Details', columns);
+      await insertRowsBulk(conn, 'Item Details', invoices, columns);
     }
 
-    console.log('Cache expired or forceRefresh requested, fetching fresh data from Apps Script...');
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 20000);
+    // 2. Process Purchases -> Table: "Invoice Details"
+    const purchases = fullData.purchases || [];
+    if (purchases.length > 0) {
+      const columns = getAllKeys(purchases);
+      await ensureTableExists(conn, 'Invoice Details', columns);
+      await insertRowsBulk(conn, 'Invoice Details', purchases, columns);
+    }
+    
+    console.log('Successfully synchronized all Google Sheets data into MySQL.');
+  } catch (err) {
+    console.error('Error syncing to MySQL:', err.message);
+  } finally {
+    if (conn) await conn.end();
+  }
+}
 
+async function ensureTableExists(conn, tableName, columns) {
+  let sql = `CREATE TABLE IF NOT EXISTS \`${tableName}\` (id INT AUTO_INCREMENT PRIMARY KEY`;
+  columns.forEach(col => {
+    sql += `, \`${col}\` LONGTEXT`;
+  });
+  sql += `) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`;
+  await conn.query(sql);
+}
+
+async function insertRowsBulk(conn, tableName, rows, columns) {
+  if (rows.length === 0) return;
+
+  const tempTableName = `${tableName}_temp`;
+  const oldTableName = `${tableName}_old`;
+
+  // 1. Clean up leftover temp and old tables if present
+  await conn.query(`DROP TABLE IF EXISTS \`${tempTableName}\``);
+  await conn.query(`DROP TABLE IF EXISTS \`${oldTableName}\``);
+
+  // 2. Ensure temp table exists with identical column schema
+  await ensureTableExists(conn, tempTableName, columns);
+
+  // 3. Clear temp table
+  await conn.query(`TRUNCATE TABLE \`${tempTableName}\``);
+
+  // 4. Insert all rows in bulk into the temp table (never lock or empty the live table during insert)
+  const colNames = columns.map(c => `\`${c}\``).join(', ');
+  const chunkSize = 100;
+  for (let i = 0; i < rows.length; i += chunkSize) {
+    const chunk = rows.slice(i, i + chunkSize);
+    let sql = `INSERT INTO \`${tempTableName}\` (${colNames}) VALUES `;
+    const values = [];
+    const placeholders = [];
+    
+    chunk.forEach(row => {
+      const rowPlaceholders = columns.map(col => {
+        let val = row[col];
+        if (val === null || val === undefined) {
+          val = '';
+        } else if (typeof val === 'object') {
+          val = JSON.stringify(val);
+        } else {
+          val = String(val);
+        }
+        values.push(val);
+        return '?';
+      });
+      placeholders.push(`(${rowPlaceholders.join(', ')})`);
+    });
+    
+    sql += placeholders.join(', ');
+    await conn.query(sql, values);
+  }
+
+  // 5. ATOMIC SWAP: Instantly swap temp table to live table (0ms downtime, zero empty state window)
+  const [tables] = await conn.query('SHOW TABLES');
+  const tableNames = tables.map(t => Object.values(t)[0].toLowerCase());
+
+  if (tableNames.includes(tableName.toLowerCase())) {
+    await conn.query(`RENAME TABLE \`${tableName}\` TO \`${oldTableName}\`, \`${tempTableName}\` TO \`${tableName}\``);
+    await conn.query(`DROP TABLE IF EXISTS \`${oldTableName}\``);
+  } else {
+    await conn.query(`RENAME TABLE \`${tempTableName}\` TO \`${tableName}\``);
+  }
+}
+
+async function loadDataFromMySQL() {
+  let conn;
+  try {
+    conn = await getDBConnection();
+    const [tables] = await conn.query('SHOW TABLES');
+    const tableNames = tables.map(t => Object.values(t)[0].toLowerCase());
+    
+    let invoices = [];
+    if (tableNames.includes('item details')) {
+      const [rows] = await conn.query('SELECT * FROM `Item Details`');
+      invoices = cleanMySQLRows(rows);
+    }
+    
+    let purchases = [];
+    if (tableNames.includes('invoice details')) {
+      const [rows] = await conn.query('SELECT * FROM `Invoice Details`');
+      purchases = cleanMySQLRows(rows);
+    }
+    
+    return {
+      success: true,
+      invoices,
+      purchases
+    };
+  } catch (err) {
+    console.error('Error reading from MySQL:', err.message);
+    throw err;
+  } finally {
+    if (conn) await conn.end();
+  }
+}
+
+function cleanMySQLRows(rows) {
+  return rows.map(row => {
+    const cleaned = { ...row };
+    delete cleaned.id;
+    return cleaned;
+  });
+}
+
+async function updateRecordInMySQL(sheetName, searchColumn, searchValue, updates) {
+  let conn;
+  try {
+    conn = await getDBConnection();
+    const tableName = sheetName === 'Purchase_data' ? 'Invoice Details' : 'Item Details';
+    
+    // Check if the table exists
+    const [tables] = await conn.query('SHOW TABLES');
+    const tableNames = tables.map(t => Object.values(t)[0].toLowerCase());
+    if (!tableNames.includes(tableName.toLowerCase())) {
+      console.warn(`Table "${tableName}" does not exist in MySQL. Skipping local update.`);
+      return;
+    }
+    
+    // Build update fields SQL
+    const keys = Object.keys(updates);
+    if (keys.length === 0) return;
+    
+    const setClauses = keys.map(k => `\`${k}\` = ?`).join(', ');
+    const values = keys.map(k => {
+      let val = updates[k];
+      if (val === null || val === undefined) {
+        return '';
+      } else if (typeof val === 'object') {
+        return JSON.stringify(val);
+      }
+      return String(val);
+    });
+    
+    // Add searchValue
+    values.push(String(searchValue));
+    
+    const sql = `UPDATE \`${tableName}\` SET ${setClauses} WHERE \`${searchColumn}\` = ?`;
+    console.log(`Executing MySQL Update: ${sql} with values:`, values);
+    const [result] = await conn.query(sql, values);
+    console.log('MySQL Update result:', result.affectedRows, 'rows affected');
+  } catch (err) {
+    console.error('MySQL Update record failed:', err.message);
+  } finally {
+    if (conn) await conn.end();
+  }
+}
+
+async function fetchFreshData() {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 120000); // 2 minutes timeout for large datasets
+
+  try {
     const response = await fetch(APPS_SCRIPT_URL, { signal: controller.signal });
     clearTimeout(timeout);
 
@@ -119,21 +330,63 @@ app.get('/api/data', async (req, res) => {
       throw new Error(`Apps Script returned ${response.status}`);
     }
 
-    const data = await response.json();
-    
-    if (data && data.success) {
-      dataCache = data;
-      dataCacheTime = now;
-      console.log('Successfully saved fresh data to memory cache');
+    const rawText = await response.text();
+    if (rawText.trim().startsWith('{') && rawText.includes('"success":true')) {
+      return rawText;
+    } else {
+      throw new Error("Invalid or unsuccessful response format from Apps Script");
     }
-    
-    res.json(data);
   } catch (err) {
-    console.error('Data proxy error:', err.message);
-    if (dataCache) {
-      console.log('Serving stale cache due to fetch error');
-      return res.json(dataCache);
+    clearTimeout(timeout);
+    throw err;
+  }
+}
+
+// GET /api/data — proxy to Google Sheets with local MySQL storage & fast retrieval
+app.get('/api/data', async (req, res) => {
+  try {
+    const forceRefresh = req.query.refresh === 'true' || req.query.forceRefresh === 'true';
+    
+    // Serve from MySQL database if not forcing a refresh
+    if (!forceRefresh) {
+      try {
+        const dbData = await loadDataFromMySQL();
+        if (dbData.invoices.length > 0 || dbData.purchases.length > 0) {
+          console.log(`Serving data from local MySQL database: ${dbData.invoices.length} invoices, ${dbData.purchases.length} purchases`);
+          return res.json(dbData);
+        }
+      } catch (dbErr) {
+        console.warn('MySQL read failed, falling back to cache/sheets:', dbErr.message);
+      }
     }
+
+    if (activeFetchPromise) {
+      console.log('Fetch already in progress, queuing request to wait for active fetch...');
+      await activeFetchPromise;
+      const dbData = await loadDataFromMySQL();
+      return res.json(dbData);
+    }
+
+    console.log('ForceRefresh requested or MySQL empty. Fetching fresh data from Google Sheets...');
+    activeFetchPromise = fetchFreshData();
+    const rawText = await activeFetchPromise;
+    activeFetchPromise = null; // Clear the active promise
+
+    const fullData = JSON.parse(rawText);
+    await syncSheetsToMySQL(fullData);
+
+    const dbData = await loadDataFromMySQL();
+    res.json(dbData);
+  } catch (err) {
+    activeFetchPromise = null; // Clear the active promise on error
+    console.error('Data proxy error:', err.message);
+    try {
+      const dbData = await loadDataFromMySQL();
+      if (dbData.invoices.length > 0 || dbData.purchases.length > 0) {
+        console.log('Serving stale data from MySQL due to sheets fetch error');
+        return res.json(dbData);
+      }
+    } catch (e) {}
     res.status(502).json({ success: false, error: err.message });
   }
 });
@@ -165,6 +418,9 @@ app.post('/api/update-record', async (req, res) => {
     if (result && (result.success || result.status === 'success')) {
       console.log('Clearing data cache due to update-record success');
       dataCache = null;
+      const { sheetName, searchColumn, searchValue, updates } = req.body;
+      await updateRecordInMySQL(sheetName, searchColumn, searchValue, updates);
+      warmCacheBackground();
     }
     
     res.json(result);
@@ -414,6 +670,7 @@ app.post('/api/delete-invoice', async (req, res) => {
     if (deletedInvoices || deletedPurchases) {
       console.log('Clearing data cache due to delete-invoice success');
       dataCache = null;
+      warmCacheBackground();
       res.json({
         success: true,
         message: `Deleted matching rows from Google Sheets.`,
@@ -442,10 +699,26 @@ app.post('/agentError', (req, res) => {
   latestNotification = {
     id: Date.now() + Math.random().toString(36).substr(2, 5),
     type: 'error',
+    endpoint: '/agentError',
     message: 'Please Connect to the Developer API Key not Working',
     timestamp: Date.now()
   };
   console.log('Received agentError hook:', latestNotification);
+  warmCacheBackground();
+  res.json({ success: true, notification: latestNotification });
+});
+
+// POST /notfound
+app.post('/notfound', (req, res) => {
+  latestNotification = {
+    id: Date.now() + Math.random().toString(36).substr(2, 5),
+    type: 'warning',
+    endpoint: '/notfound',
+    message: 'Bill not found or missing records in ERP.',
+    timestamp: Date.now()
+  };
+  console.log('Received notfound hook:', latestNotification);
+  warmCacheBackground();
   res.json({ success: true, notification: latestNotification });
 });
 
@@ -454,10 +727,12 @@ app.post('/excutedSucess', (req, res) => {
   latestNotification = {
     id: Date.now() + Math.random().toString(36).substr(2, 5),
     type: 'success',
+    endpoint: '/excutedSucess',
     message: 'Check the Bill, booking is complete.',
     timestamp: Date.now()
   };
   console.log('Received excutedSucess hook:', latestNotification);
+  warmCacheBackground(); // Immediately sync new data to MySQL
   res.json({ success: true, notification: latestNotification });
 });
 
@@ -466,10 +741,12 @@ app.post('/executedSuccess', (req, res) => {
   latestNotification = {
     id: Date.now() + Math.random().toString(36).substr(2, 5),
     type: 'success',
+    endpoint: '/executedSuccess',
     message: 'Check the Bill, booking is complete.',
     timestamp: Date.now()
   };
   console.log('Received executedSuccess hook:', latestNotification);
+  warmCacheBackground(); // Immediately sync new data to MySQL
   res.json({ success: true, notification: latestNotification });
 });
 
@@ -478,6 +755,33 @@ app.get('/api/agent-notification', (req, res) => {
   res.json({ success: true, notification: latestNotification });
 });
 
+
+// Warm cache background runner
+async function warmCacheBackground() {
+  if (activeFetchPromise) {
+    console.log('Cache warming already in progress, skipping background trigger.');
+    return;
+  }
+  console.log('Background cache warming started...');
+  try {
+    activeFetchPromise = fetchFreshData();
+    const rawText = await activeFetchPromise;
+    activeFetchPromise = null;
+    
+    const fullData = JSON.parse(rawText);
+    await syncSheetsToMySQL(fullData);
+    console.log('Successfully warmed MySQL database in background.');
+  } catch (err) {
+    activeFetchPromise = null;
+    console.warn('Background cache warming failed:', err.message);
+  }
+}
+
+// Start cache warming immediately on start-up
+warmCacheBackground();
+
+// Periodically re-warm cache every 20 seconds (20000 ms) to keep it fresh
+setInterval(warmCacheBackground, 20000);
 
 if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
   app.listen(PORT, () => {
